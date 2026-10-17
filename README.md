@@ -6,3 +6,5 @@
 - Created the assignment working directory in Ubuntu WSL 2.
 
 - Verified Ubuntu-to-Alpine connectivity using nc on port 1234; captured client and server screenshots.
+
+- Installed bash, curl, iproute2, and net-tools in the Alpine server container.
