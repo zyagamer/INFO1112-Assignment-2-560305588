@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Default listener port
+# The actual listening port is discovered below using ss.
+SERVER_PORT="${SERVER_PORT:-1234}"
 
 server_ip=$(ifconfig eth0 | awk '/inet / {print $2}')
 
