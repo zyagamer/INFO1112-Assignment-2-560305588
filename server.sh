@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# AI acknowledgement: OpenAI ChatGPT assisted with Bash implementation,
+# debugging and test commands, and generated the Python plotting section.
+
 # Default listener port
 # The actual listening port is discovered below using ss.
 SERVER_PORT="${SERVER_PORT:-1234}"
@@ -30,6 +33,26 @@ json_escape() {
     value="${value//$'\r'/\\r}"
     value="${value//$'\t'/\\t}"
     printf '%s' "$value"
+}
+
+# Publish a complete named output atomically, but send this request's private file so cannot change the response being sent.
+send_response_file() {
+    local private_file="$1" output_dir saved_file staging_file
+    output_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+    saved_file="$output_dir/$(basename -- "$private_file")"
+    staging_file=$(mktemp "$output_dir/.response.XXXXXX") || {
+        echo 'Error: could not prepare saved response.' >&2
+        printf '{"error":"Could not save response"}\n'
+        return 1
+    }
+    if ! cp -- "$private_file" "$staging_file" ||
+       ! mv -f -- "$staging_file" "$saved_file"; then
+        rm -f -- "$staging_file"
+        echo 'Error: could not save response.' >&2
+        printf '{"error":"Could not save response"}\n'
+        return 1
+    fi
+    cat -- "$private_file"
 }
 
 assignment_response() {
@@ -100,7 +123,7 @@ assignment_response() {
     # Display the downloaded assignment information on the server.
     printf '%s\n' "$block" >&2
 
-    output_file="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/assignment.json"
+    output_file="$response_dir/assignment.json"
 
     if ! printf '{\n  "title": "%s",\n  "topic": "%s",\n  "due_date": "%s",\n  "points": %s\n}\n' \
         "$(json_escape "$title")" \
@@ -112,7 +135,7 @@ assignment_response() {
         return 1
     fi
 
-    cat "$output_file"
+    send_response_file "$output_file"
 }
 
 population_response() {
@@ -213,7 +236,7 @@ PY
         return 1
     fi
 
-    output_file="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/population.png"
+    output_file="$response_dir/population.png"
 
     if ! mv -- "$work_dir/population.png" "$output_file"; then
         echo "Error: could not save population.png." >&2
@@ -225,7 +248,7 @@ PY
     rm -rf -- "$work_dir"
 
     # Only the image bytes go to the client.
-    cat "$output_file"
+    send_response_file "$output_file"
 }
 
 poi_response() (
@@ -369,10 +392,10 @@ poi_response() (
         }]
     }' > "$work_dir/result.json" || poi_fail 'Could not create POI response'
 
-    output_file="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/nearby-pois.json"
+    output_file="$response_dir/nearby-pois.json"
     mv -- "$work_dir/result.json" "$output_file" || poi_fail 'Could not save POI response'
     printf 'Returning %s POIs within %s metres\n' "$total" "$radius" >&2
-    cat "$output_file"
+    send_response_file "$output_file"
 )
 
 
@@ -382,7 +405,8 @@ serve_connection() (
     local connection_dir="$1"
     local listener_pid="" lock_dir="" owns_lock=0
     local peer="" client_ip="" listening_port="" request=""
-    local announced=0 send_fd receive_fd
+    local announced=0 send_fd receive_fd listener_status
+    local response_dir=""
 
     connection_cleanup() {
         if [[ -n "$listener_pid" ]]; then
@@ -391,6 +415,9 @@ serve_connection() (
         fi
         if (( owns_lock )); then
             rmdir -- "$lock_dir" 2>/dev/null || true
+        fi
+        if [[ -n "$response_dir" ]]; then
+            rm -rf -- "$response_dir"
         fi
     }
     trap connection_cleanup EXIT
@@ -422,7 +449,17 @@ serve_connection() (
         [[ -n "$peer" ]] && break
 
         if ! kill -0 "$listener_pid" 2>/dev/null; then
-            echo 'Error: listener ended before a client could be identified.' >&2
+            if wait "$listener_pid"; then
+                listener_status=0
+            else
+                listener_status=$?
+            fi
+            listener_pid=""
+            if (( listener_status == 0 )); then
+                echo 'Client disconnected before identification; listening again.' >&2
+                exit 75
+            fi
+            echo 'Error: netcat listener failed.' >&2
             exit 1
         fi
         sleep 0.1
@@ -454,6 +491,10 @@ serve_connection() (
     else
         request=${request%$'\r'}
         printf 'Received: %s\n' "$request"
+        response_dir=$(mktemp -d "$server_work_dir/response.XXXXXX") || {
+            printf '{"error":"Could not prepare response files"}\n' >&"$send_fd"
+            exit 1
+        }
         case "$request" in
             assignment)
                 if ! assignment_response >&"$send_fd"; then
@@ -523,7 +564,17 @@ while true; do
 
     while [[ ! -f "$connection_dir/accepted" ]]; do
         if ! kill -0 "$worker_pid" 2>/dev/null; then
-            wait "$worker_pid" 2>/dev/null || true
+            if wait "$worker_pid"; then
+                worker_status=0
+            else
+                worker_status=$?
+            fi
+            # Exclude the reaped worker from later cleanup/reaping.
+            unset 'workers[${#workers[@]}-1]'
+            if (( worker_status == 75 )); then
+                rmdir -- "$connection_dir" 2>/dev/null || true
+                continue 2
+            fi
             echo 'Error: connection worker stopped before accepting a client.' >&2
             exit 1
         fi
