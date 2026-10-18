@@ -45,11 +45,52 @@ fi
 
 script_path="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
 
-while true; do
-    printf 'Waiting for a request...\n'
+listener_pid=""
 
-    if ! INFO1112_CLIENT_MODE=1 nc -l -p "$SERVER_PORT" -e "$script_path"; then
+cleanup() {
+    if [[ -n "$listener_pid" ]]; then
+        kill "$listener_pid" 2>/dev/null || true
+    fi
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+while true; do
+    INFO1112_CLIENT_MODE=1 nc -l -p "$SERVER_PORT" -e "$script_path" &
+    listener_pid=$!
+
+    listening_port=""
+
+    # Allow the listener time to start.
+    for ((attempt = 0; attempt < 30; attempt++)); do
+        listening_port=$(ss -ltnpH | awk -v pid="$listener_pid" '
+            index($0, "pid=" pid ",") {
+                address = $4
+                sub(/^.*:/, "", address)
+                print address
+                exit
+            }
+        ')
+
+        [[ -n "$listening_port" ]] && break
+        kill -0 "$listener_pid" 2>/dev/null || break
+        sleep 0.1
+    done
+
+    if [[ -z "$listening_port" ]]; then
+        echo "Error: could not detect the listening port." >&2
+        exit 1
+    fi
+
+    printf 'Server listening at %s, port=%s\n' \
+        "$server_ip" "$listening_port"
+
+    if ! wait "$listener_pid"; then
         echo "Error: listener failed." >&2
         exit 1
     fi
+
+    listener_pid=""
 done
