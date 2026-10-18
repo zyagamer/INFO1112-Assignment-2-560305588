@@ -19,19 +19,6 @@ if (( SERVER_PORT < 1 || SERVER_PORT > 65535 )); then
     exit 1
 fi
 
-listener_pid=""
-
-cleanup() {
-    if [[ -n "$listener_pid" ]]; then
-        kill "$listener_pid" 2>/dev/null || true
-        wait "$listener_pid" 2>/dev/null || true
-    fi
-}
-
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
 json_escape() {
     local value="$1"
     value="${value//\\/\\\\}"
@@ -386,89 +373,159 @@ poi_response() (
 )
 
 
-while true; do
-    coproc CONNECTION {
-        exec nc -4 -l -N "$SERVER_PORT"
-    }
+# Each connection runs in its own Bash worker. A directory created with
+# mkdir acts as an atomic lock for the client IP across all workers.
+serve_connection() (
+    local connection_dir="$1"
+    local listener_pid="" lock_dir="" owns_lock=0
+    local peer="" client_ip="" listening_port="" request=""
+    local announced=0 send_fd receive_fd
 
+    connection_cleanup() {
+        if [[ -n "$listener_pid" ]]; then
+            kill "$listener_pid" 2>/dev/null || true
+            wait "$listener_pid" 2>/dev/null || true
+        fi
+        if (( owns_lock )); then
+            rmdir -- "$lock_dir" 2>/dev/null || true
+        fi
+    }
+    trap connection_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    coproc CONNECTION { exec nc -4 -l -N "$SERVER_PORT"; }
     listener_pid=$CONNECTION_PID
     send_fd=${CONNECTION[1]}
     receive_fd=${CONNECTION[0]}
 
-    listening_port=""
-
-    for ((attempt = 0; attempt < 30; attempt++)); do
+    # Inspect both listening and connected sockets. This also handles a
+    # client arriving before the first listening-socket inspection.
+    while [[ -z "$peer" ]]; do
         listening_port=$(ss -ltnpH | awk -v pid="$listener_pid" '
             index($0, "pid=" pid ",") {
-                address = $4
-                sub(/^.*:/, "", address)
-                print address
-                exit
+                address=$4; sub(/^.*:/, "", address); print address; exit
             }
         ')
+        if [[ -n "$listening_port" ]] && (( ! announced )); then
+            printf 'Server listening at %s, port=%s\n' "$server_ip" "$listening_port"
+            announced=1
+        fi
 
-        [[ -n "$listening_port" ]] && break
-        kill -0 "$listener_pid" 2>/dev/null || break
+        peer=$(ss -tnpH | awk -v pid="$listener_pid" '
+            index($0, "pid=" pid ",") &&
+            ($1 == "ESTAB" || $1 == "CLOSE-WAIT") {print $5; exit}
+        ')
+        [[ -n "$peer" ]] && break
+
+        if ! kill -0 "$listener_pid" 2>/dev/null; then
+            echo 'Error: listener ended before a client could be identified.' >&2
+            exit 1
+        fi
         sleep 0.1
     done
 
-    if [[ -z "$listening_port" ]]; then
-        echo "Error: could not detect the listening port." >&2
+    client_ip="${peer%:*}"
+    [[ "$client_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+        echo 'Error: could not identify an IPv4 client.' >&2
+        exit 1
+    }
+    lock_dir="$server_work_dir/busy-$client_ip"
+    if mkdir -- "$lock_dir" 2>/dev/null; then
+        owns_lock=1
+    elif [[ ! -d "$lock_dir" ]]; then
+        echo 'Error: could not create client lock.' >&2
         exit 1
     fi
 
-    printf 'Server listening at %s, port=%s\n' \
-        "$server_ip" "$listening_port"
+    # The accepted connection no longer needs the listening socket.
+    # Notify the parent to start listening for the next connection.
+    touch "$connection_dir/accepted" || exit 1
+    printf 'Client IP: %s\n' "$client_ip"
 
-    if IFS= read -r -u "$receive_fd" request; then
-        peer=$(ss -tnpH | awk -v pid="$listener_pid" '
-            index($0, "pid=" pid ",") {
-                print $5
-                exit
-            }
-        ')
-
-        if [[ -n "$peer" ]]; then
-            client_ip="${peer%:*}"
-            printf 'Client IP: %s\n' "$client_ip"
-        else
-            echo "Error: could not determine client IP." >&2
-        fi
-
+    if ! IFS= read -r -t 30 -u "$receive_fd" request; then
+        printf '{"error":"No complete request received within 30 seconds"}\n' >&"$send_fd"
+    elif (( ! owns_lock )); then
+        printf 'Rejected busy client: %s\n' "$client_ip"
+        printf '{"error":"A request from this client IP is already being processed"}\n' >&"$send_fd"
+    else
+        request=${request%$'\r'}
         printf 'Received: %s\n' "$request"
         case "$request" in
             assignment)
                 if ! assignment_response >&"$send_fd"; then
-                    echo "Assignment request failed." >&2
+                    echo 'Assignment request failed.' >&2
                 fi
                 ;;
-
-             population)
+            population)
                 if ! population_response >&"$send_fd"; then
-                    echo "Population request failed." >&2
+                    echo 'Population request failed.' >&2
                 fi
-                ;;    
+                ;;
             poi\ *)
                 if ! poi_response "$request" >&"$send_fd"; then
-                    echo "POI request failed." >&2
+                    echo 'POI request failed.' >&2
                 fi
                 ;;
-            *)
-                printf '{"error":"Unknown request"}\n' >&"$send_fd"
-                ;;
+            *) printf '{"error":"Unknown request"}\n' >&"$send_fd" ;;
         esac
-    else
-        echo "Error: client disconnected without a complete request." >&2
     fi
 
-    # Finish the response so netcat can signal EOF to the client.
     exec {send_fd}>&-
     exec {receive_fd}<&-
 
-    if ! wait "$listener_pid"; then
-        echo "Error: netcat exited unsuccessfully." >&2
-        exit 1
-    fi
-
+    # Bound the time spent waiting for a client to close after the reply.
+    for ((finish_attempt=0; finish_attempt<100; finish_attempt++)); do
+        kill -0 "$listener_pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill "$listener_pid" 2>/dev/null || true
+    wait "$listener_pid" 2>/dev/null || true
     listener_pid=""
+)
+
+server_work_dir=$(mktemp -d) || exit 1
+workers=()
+
+server_cleanup() {
+    local pid
+    for pid in "${workers[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in "${workers[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    rm -rf -- "$server_work_dir"
+}
+trap server_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+while true; do
+    # Reap completed workers; their traps have already released their locks.
+    active_workers=()
+    for pid in "${workers[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            active_workers+=("$pid")
+        else
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
+    workers=("${active_workers[@]}")
+
+    connection_dir=$(mktemp -d "$server_work_dir/connection.XXXXXX") || exit 1
+    serve_connection "$connection_dir" &
+    worker_pid=$!
+    workers+=("$worker_pid")
+
+    while [[ ! -f "$connection_dir/accepted" ]]; do
+        if ! kill -0 "$worker_pid" 2>/dev/null; then
+            wait "$worker_pid" 2>/dev/null || true
+            echo 'Error: connection worker stopped before accepting a client.' >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+    rm -f -- "$connection_dir/accepted"
+    rmdir -- "$connection_dir"
 done
