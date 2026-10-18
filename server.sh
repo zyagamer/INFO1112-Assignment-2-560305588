@@ -125,6 +125,119 @@ assignment_response() {
     cat "$output_file"
 }
 
+population_response() {
+    local work_dir output_file header row year population
+    local latest_year=0 latest_population=""
+    local -a years fields
+
+    work_dir=$(mktemp -d) || {
+        echo "Error: could not create temporary directory." >&2
+        printf '{"error":"Could not prepare population data"}\n'
+        return 1
+    }
+
+    if ! curl -fLsS --max-time 30 \
+        'https://dbr.abs.gov.au/processedData/csv/STE_1.csv' \
+        -o "$work_dir/source.csv"; then
+        echo "Error: population download failed." >&2
+        rm -rf -- "$work_dir"
+        printf '{"error":"Population download failed"}\n'
+        return 1
+    fi
+
+    IFS= read -r header < "$work_dir/source.csv"
+    header=${header%$'\r'}
+    IFS=',' read -r -a years <<< "$header"
+
+    # Bash extracts the year/population pairs.
+    while IFS= read -r row || [[ -n "$row" ]]; do
+        row=${row%$'\r'}
+        IFS=',' read -r -a fields <<< "$row"
+
+        [[ "${fields[0]:-}" == "ERP_P_20" ]] || continue
+
+        for ((i = 3; i < ${#years[@]}; i++)); do
+            year=${years[i]}
+            population=${fields[i]:-}
+
+            if [[ "$year" =~ ^[0-9]{4}$ &&
+                  "$population" =~ ^[0-9]+$ ]]; then
+                printf '%s,%s\n' "$year" "$population"
+
+                if (( 10#$year > latest_year )); then
+                    latest_year=$((10#$year))
+                    latest_population=$population
+                fi
+            fi
+        done
+
+        break
+    done < "$work_dir/source.csv" > "$work_dir/pairs.csv"
+
+    if [[ -z "$latest_population" ]]; then
+        echo "Error: no valid population data found." >&2
+        rm -rf -- "$work_dir"
+        printf '{"error":"No valid population data found"}\n'
+        return 1
+    fi
+
+    printf 'Latest NSW population (%s): %s\n' \
+        "$latest_year" "$latest_population" >&2
+
+    # AI acknowledgement: this Python plotting section was generated
+    # with assistance from OpenAI ChatGPT.
+    # It reads only the pairs already extracted by Bash.
+    if ! python3 - "$work_dir/pairs.csv" "$work_dir/population.png" <<'PY'
+import sys
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.ticker import StrMethodFormatter
+
+pairs = []
+with open(sys.argv[1], encoding="utf-8") as source:
+    for line in source:
+        year, population = line.strip().split(",")
+        pairs.append((int(year), int(population)))
+
+pairs.sort()
+years, populations = zip(*pairs)
+
+fig, ax = plt.subplots(figsize=(9, 5))
+ax.plot(years, populations, marker="o")
+ax.set_title("NSW estimated resident population — 30 June")
+ax.set_xlabel("Year")
+ax.set_ylabel("Population (people)")
+ax.set_xticks(years)
+ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+ax.grid(True, alpha=0.3)
+fig.tight_layout()
+fig.savefig(sys.argv[2], dpi=150)
+plt.close(fig)
+PY
+    then
+        echo "Error: population plotting failed." >&2
+        rm -rf -- "$work_dir"
+        printf '{"error":"Population plotting failed"}\n'
+        return 1
+    fi
+
+    output_file="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/population.png"
+
+    if ! mv -- "$work_dir/population.png" "$output_file"; then
+        echo "Error: could not save population.png." >&2
+        rm -rf -- "$work_dir"
+        printf '{"error":"Could not save population plot"}\n'
+        return 1
+    fi
+
+    rm -rf -- "$work_dir"
+
+    # Only the image bytes go to the client.
+    cat "$output_file"
+}
+
 while true; do
     coproc CONNECTION {
         exec nc -4 -l -N "$SERVER_PORT"
@@ -181,6 +294,12 @@ while true; do
                     echo "Assignment request failed." >&2
                 fi
                 ;;
+
+             population)
+                if ! population_response >&"$send_fd"; then
+                    echo "Population request failed." >&2
+                fi
+                ;;    
             *)
                 printf '{"error":"Unknown request"}\n' >&"$send_fd"
                 ;;
