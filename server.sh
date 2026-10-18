@@ -238,6 +238,154 @@ PY
     cat "$output_file"
 }
 
+poi_response() (
+    # A subshell keeps this request's temporary files and traps isolated.
+    work_dir=""
+    trap '[[ -z "$work_dir" ]] || rm -rf -- "$work_dir"' EXIT
+
+    poi_fail() {
+        printf 'POI error: %s\n' "$1" >&2
+        jq -n --arg message "$1" '{error: $message}'
+        exit 1
+    }
+
+    api='https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_POI/MapServer/0/query'
+    work_dir=$(mktemp -d) || poi_fail 'Could not create temporary directory'
+
+    poi_fetch() {
+        local destination="$1"
+        shift
+        curl -fSsG --connect-timeout 10 --max-time 60 "$api" \
+            --data-urlencode 'f=json' "$@" -o "$destination" ||
+            poi_fail 'NSW POI API request failed'
+        jq -e 'type == "object" and .error == null' "$destination" >/dev/null ||
+            poi_fail 'NSW POI API returned an error or invalid JSON'
+    }
+
+    input="$1"
+    separators="${input//[^|]/}"
+    IFS='|' read -r mode first second third <<< "$input"
+
+    case "$mode" in
+        'poi name')
+            [[ ${#separators} -eq 2 && -n "$first" ]] ||
+                poi_fail 'Use poi name|PLACE NAME|RADIUS_METRES'
+            radius="$second"
+            ;;
+        'poi coords')
+            [[ ${#separators} -eq 3 ]] ||
+                poi_fail 'Use poi coords|LATITUDE|LONGITUDE|RADIUS_METRES'
+            latitude="$first"
+            longitude="$second"
+            radius="$third"
+            ;;
+        *) poi_fail 'Unknown POI request format' ;;
+    esac
+
+    # Limit input size before arithmetic; radius must be a positive integer.
+    [[ "$radius" =~ ^[0-9]{1,6}$ ]] ||
+        poi_fail 'Radius must be an integer from 1 to 999999 metres'
+    radius=$((10#$radius))
+    (( radius > 0 )) || poi_fail 'Radius must be greater than zero'
+
+    if [[ "$mode" == 'poi name' ]]; then
+        name="${first^^}"
+        escaped_name=$(printf '%s' "$name" | sed "s/'/''/g")
+        poi_fetch "$work_dir/location.json" \
+            --data-urlencode "where=poiname='$escaped_name'" \
+            --data-urlencode 'outFields=objectid,poiname' \
+            --data-urlencode 'returnGeometry=true' \
+            --data-urlencode 'outSR=4326'
+
+        jq -e '.features | type == "array"' "$work_dir/location.json" >/dev/null ||
+            poi_fail 'Location lookup did not return a feature array'
+        matches=$(jq '.features | length' "$work_dir/location.json")
+        (( matches > 0 )) || poi_fail 'No POI matches that name; try its official name or coordinates'
+        [[ "$matches" == 1 ]] &&
+            jq -e '.exceededTransferLimit != true' "$work_dir/location.json" >/dev/null ||
+            poi_fail 'Multiple POIs match that name; use coordinates instead'
+        latitude=$(jq -r '.features[0].geometry.y' "$work_dir/location.json")
+        longitude=$(jq -r '.features[0].geometry.x' "$work_dir/location.json")
+    fi
+
+    [[ "$latitude" =~ ^-?[0-9]+(\.[0-9]+)?$ &&
+       "$longitude" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] ||
+        poi_fail 'Coordinates must be decimal numbers'
+    jq -en --arg lat "$latitude" --arg lon "$longitude" '
+        ($lat | tonumber) as $y | ($lon | tonumber) as $x |
+        $y >= -90 and $y <= 90 and $x >= -180 and $x <= 180
+    ' >/dev/null || poi_fail 'Latitude or longitude is out of range'
+
+    poi_fetch "$work_dir/ids.json" \
+        --data-urlencode 'where=1=1' \
+        --data-urlencode "geometry=$longitude,$latitude" \
+        --data-urlencode 'geometryType=esriGeometryPoint' \
+        --data-urlencode 'inSR=4326' \
+        --data-urlencode 'spatialRel=esriSpatialRelIntersects' \
+        --data-urlencode "distance=$radius" \
+        --data-urlencode 'units=esriSRUnit_Meter' \
+        --data-urlencode 'returnIdsOnly=true'
+
+    jq -e 'has("objectIds") and
+        (.objectIds == null or (.objectIds | type) == "array") and
+        (.exceededTransferLimit != true)' "$work_dir/ids.json" >/dev/null ||
+        poi_fail 'API returned an invalid or incomplete ID list'
+    jq '(.objectIds // []) | unique | sort' "$work_dir/ids.json" \
+        > "$work_dir/expected.json" || poi_fail 'Could not prepare POI IDs'
+    total=$(jq 'length' "$work_dir/expected.json")
+
+    for ((offset = 0; offset < total; offset += 500)); do
+        ids=$(jq -r --argjson start "$offset" '
+            .[$start:($start + 500)] | map(tostring) | join(",")
+        ' "$work_dir/expected.json") || poi_fail 'Could not prepare batch'
+        printf 'Fetching POIs %s-%s of %s\n' "$((offset + 1))" \
+            "$((offset + 500 < total ? offset + 500 : total))" "$total" >&2
+
+        poi_fetch "$work_dir/batch-$offset.json" \
+            --data-urlencode "objectIds=$ids" \
+            --data-urlencode 'outFields=objectid,poiname,poitype' \
+            --data-urlencode 'returnGeometry=true' \
+            --data-urlencode 'outSR=4326'
+        jq -e '(.features | type) == "array" and
+            (.exceededTransferLimit != true)' "$work_dir/batch-$offset.json" >/dev/null ||
+            poi_fail 'POI batch was invalid or incomplete'
+    done
+
+    if (( total == 0 )); then
+        printf '[]\n' > "$work_dir/features.json"
+    else
+        jq -s '[.[].features[]] | unique_by(.attributes.objectid)' \
+            "$work_dir"/batch-*.json > "$work_dir/features.json" ||
+            poi_fail 'Could not combine POI batches'
+    fi
+
+    jq -en --slurpfile expected "$work_dir/expected.json" \
+        --slurpfile features "$work_dir/features.json" '
+        $expected[0] == ($features[0] | map(.attributes.objectid) | unique | sort)
+    ' >/dev/null || poi_fail 'Returned POI IDs do not match requested IDs'
+
+    jq -n --arg lat "$latitude" --arg lon "$longitude" \
+        --argjson radius "$radius" --slurpfile features "$work_dir/features.json" '{
+        source: "NSW Points of Interest API",
+        center: {latitude: ($lat | tonumber), longitude: ($lon | tonumber)},
+        radius_metres: $radius,
+        count: ($features[0] | length),
+        pois: [$features[0][] | {
+            id: .attributes.objectid,
+            name: .attributes.poiname,
+            type: .attributes.poitype,
+            longitude: .geometry.x,
+            latitude: .geometry.y
+        }]
+    }' > "$work_dir/result.json" || poi_fail 'Could not create POI response'
+
+    output_file="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/nearby-pois.json"
+    mv -- "$work_dir/result.json" "$output_file" || poi_fail 'Could not save POI response'
+    printf 'Returning %s POIs within %s metres\n' "$total" "$radius" >&2
+    cat "$output_file"
+)
+
+
 while true; do
     coproc CONNECTION {
         exec nc -4 -l -N "$SERVER_PORT"
@@ -300,6 +448,11 @@ while true; do
                     echo "Population request failed." >&2
                 fi
                 ;;    
+            poi\ *)
+                if ! poi_response "$request" >&"$send_fd"; then
+                    echo "POI request failed." >&2
+                fi
+                ;;
             *)
                 printf '{"error":"Unknown request"}\n' >&"$send_fd"
                 ;;
