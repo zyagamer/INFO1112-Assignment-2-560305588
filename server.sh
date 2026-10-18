@@ -2,6 +2,24 @@
 
 # Netcat runs this same script in client-handling mode.
 if [[ "${INFO1112_CLIENT_MODE:-}" == "1" ]]; then
+    peer=$(ss -tnH | awk -v port="$SERVER_PORT" '
+        ($1 == "ESTAB" || $1 == "CLOSE-WAIT") &&
+        $4 ~ (":" port "$") {
+            print $5
+            exit
+        }
+    ')
+
+    if [[ -n "$peer" ]]; then
+        client_ip="${peer%:*}"
+        client_ip="${client_ip#\[}"
+        client_ip="${client_ip%\]}"
+        client_ip="${client_ip#::ffff:}"
+        printf 'Client IP: %s\n' "$client_ip" >&2
+    else
+        printf 'Error: could not determine client IP.\n' >&2
+    fi
+    
     if IFS= read -r request; then
         printf 'Received: %s\n' "$request" >&2
         printf 'OK: received %s\n' "$request"
