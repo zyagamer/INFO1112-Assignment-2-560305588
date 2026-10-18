@@ -32,6 +32,99 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+json_escape() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '%s' "$value"
+}
+
+assignment_response() {
+    local html text block title topic due points output_file
+
+    if ! html=$(curl -fLsS --max-time 30 \
+        'https://www.sydney.edu.au/units/INFO1112/2026-S2C-ND-CC'); then
+        echo "Error: could not download the unit webpage." >&2
+        printf '{"error":"Could not download assignment information"}\n'
+        return 1
+    fi
+
+    if ! text=$(printf '%s' "$html" | html2text -width 1000); then
+        echo "Error: HTML conversion failed." >&2
+        printf '{"error":"Could not convert assignment information"}\n'
+        return 1
+    fi
+
+    block=$(printf '%s\n' "$text" | awk '
+        /Assignment 2/ {capture = 1}
+        capture && /Outcomes assessed:/ {exit}
+        capture {print}
+    ')
+
+    title=$(printf '%s\n' "$block" | awk '
+        /Assignment 2/ {
+            sub(/^[[:space:]]+/, "")
+            sub(/[[:space:]]+Week.*/, "")
+            sub(/[[:space:]]+$/, "")
+            print
+            exit
+        }
+    ')
+
+    topic=$(printf '%s\n' "$block" | awk '
+        /Programming task[[:space:]]*-/ {
+            sub(/^.*Programming task[[:space:]]*-[[:space:]]*/, "")
+            sub(/[[:space:]]+[0-9]+%.*/, "")
+            sub(/[[:space:]]+$/, "")
+            print
+            exit
+        }
+    ')
+
+    due=$(printf '%s\n' "$block" | awk '
+        /Due date:/ {
+            sub(/^.*Due date:[[:space:]]*/, "")
+            if ($4 == "at")
+                print $1 " " $2 " " $3 " " $5
+            exit
+        }
+    ')
+
+    points=$(printf '%s\n' "$block" | awk '
+        /Programming task/ && match($0, /[0-9]+%/) {
+            print substr($0, RSTART, RLENGTH - 1)
+            exit
+        }
+    ')
+
+    if [[ -z "$title" || -z "$topic" || -z "$due" ||
+          ! "$points" =~ ^[0-9]+$ ]]; then
+        echo "Error: assignment fields could not be extracted." >&2
+        printf '{"error":"Could not extract assignment fields"}\n'
+        return 1
+    fi
+
+    # Display the downloaded assignment information on the server.
+    printf '%s\n' "$block" >&2
+
+    output_file="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/assignment.json"
+
+    if ! printf '{\n  "title": "%s",\n  "topic": "%s",\n  "due_date": "%s",\n  "points": %s\n}\n' \
+        "$(json_escape "$title")" \
+        "$(json_escape "$topic")" \
+        "$(json_escape "$due")" \
+        "$((10#$points))" > "$output_file"; then
+        echo "Error: could not write assignment.json." >&2
+        printf '{"error":"Could not create assignment.json"}\n'
+        return 1
+    fi
+
+    cat "$output_file"
+}
+
 while true; do
     coproc CONNECTION {
         exec nc -4 -l -N "$SERVER_PORT"
@@ -82,7 +175,16 @@ while true; do
         fi
 
         printf 'Received: %s\n' "$request"
-        printf 'OK: received %s\n' "$request" >&"$send_fd"
+        case "$request" in
+            assignment)
+                if ! assignment_response >&"$send_fd"; then
+                    echo "Assignment request failed." >&2
+                fi
+                ;;
+            *)
+                printf '{"error":"Unknown request"}\n' >&"$send_fd"
+                ;;
+        esac
     else
         echo "Error: client disconnected without a complete request." >&2
     fi
