@@ -1,585 +1,273 @@
 #!/usr/bin/env bash
 # AI acknowledgement: OpenAI ChatGPT assisted with Bash implementation,
-# debugging and test commands, and generated the Python plotting section.
+# debugging and tests, and generated the Python plotting section.
 
-# Default listener port
-# The actual listening port is discovered below using ss.
-SERVER_PORT="${SERVER_PORT:-1234}"
-
-server_ip=$(ifconfig eth0 | awk '/inet / {print $2}')
-
-if [[ -z "$server_ip" ]]; then
-    echo "Error: could not determine the server IP address." >&2
+SERVER_PORT=${SERVER_PORT:-1234}
+if [[ ! "$SERVER_PORT" =~ ^[0-9]{1,5}$ ]]; then
+    echo 'Error: invalid listening port.' >&2
     exit 1
 fi
-
-if [[ ! "${SERVER_PORT:-}" =~ ^[0-9]{1,5}$ ]]; then
-    echo "Error: configure SERVER_PORT with a number from 1 to 65535." >&2
-    exit 1
-fi
-
 SERVER_PORT=$((10#$SERVER_PORT))
-
 if (( SERVER_PORT < 1 || SERVER_PORT > 65535 )); then
-    echo "Error: port must be between 1 and 65535." >&2
+    echo 'Error: port must be between 1 and 65535.' >&2
     exit 1
 fi
+cd -- "$(dirname -- "$0")" || exit 1
+work=${INFO1112_WORK:-}
 
-json_escape() {
-    local value="$1"
-    value="${value//\\/\\\\}"
-    value="${value//\"/\\\"}"
-    value="${value//$'\n'/\\n}"
-    value="${value//$'\r'/\\r}"
-    value="${value//$'\t'/\\t}"
-    printf '%s' "$value"
-}
-
-# Publish a complete named output atomically, but send this request's private file so cannot change the response being sent.
-send_response_file() {
-    local private_file="$1" output_dir saved_file staging_file
-    output_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-    saved_file="$output_dir/$(basename -- "$private_file")"
-    staging_file=$(mktemp "$output_dir/.response.XXXXXX") || {
-        echo 'Error: could not prepare saved response.' >&2
-        printf '{"error":"Could not save response"}\n'
-        return 1
-    }
-    if ! cp -- "$private_file" "$staging_file" ||
-       ! mv -f -- "$staging_file" "$saved_file"; then
-        rm -f -- "$staging_file"
-        echo 'Error: could not save response.' >&2
-        printf '{"error":"Could not save response"}\n'
-        return 1
-    fi
-    cat -- "$private_file"
+error() {
+    printf 'Error: %s\n' "$1" >&2
+    jq -n --arg message "$1" '{error: $message}'
+    return 1
 }
 
 assignment_response() {
-    local html text block title topic due points output_file
-
-    if ! html=$(curl -fLsS --max-time 30 \
-        'https://www.sydney.edu.au/units/INFO1112/2026-S2C-ND-CC'); then
-        echo "Error: could not download the unit webpage." >&2
-        printf '{"error":"Could not download assignment information"}\n'
-        return 1
+    local block title topic due points
+    curl -fLsS --max-time 30 \
+        'https://www.sydney.edu.au/units/INFO1112/2026-S2C-ND-CC' \
+        -o "$work/unit.html" || { error 'Assignment download failed'; return 1; }
+    html2text -width 1000 "$work/unit.html" > "$work/unit.txt" || {
+        error 'HTML conversion failed'; return 1;
+    }
+    block=$(awk '/Assignment 2/ {show=1}
+        show && /Outcomes assessed:/ {exit}
+        show {print}' "$work/unit.txt")
+    title=$(printf '%s\n' "$block" | awk '/Assignment 2/ {
+        sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+Week.*/, ""); print; exit}')
+    topic=$(printf '%s\n' "$block" | awk '/Programming task/ {
+        sub(/^.*Programming task[[:space:]]*-[[:space:]]*/, "")
+        sub(/[[:space:]]+[0-9]+%.*/, ""); print; exit}')
+    due=$(printf '%s\n' "$block" | awk '/Due date:/ {
+        sub(/^.*Due date:[[:space:]]*/, "")
+        if ($4 == "at") print $1 " " $2 " " $3 " " $5; exit}')
+    points=$(printf '%s\n' "$block" | awk '/Programming task/ && match($0, /[0-9]+%/) {
+        print substr($0, RSTART, RLENGTH-1); exit}')
+    if [[ -z "$title" || -z "$topic" || -z "$due" || ! "$points" =~ ^[0-9]+$ ]]; then
+        error 'Could not extract assignment fields'; return 1
     fi
-
-    if ! text=$(printf '%s' "$html" | html2text -width 1000); then
-        echo "Error: HTML conversion failed." >&2
-        printf '{"error":"Could not convert assignment information"}\n'
-        return 1
-    fi
-
-    block=$(printf '%s\n' "$text" | awk '
-        /Assignment 2/ {capture = 1}
-        capture && /Outcomes assessed:/ {exit}
-        capture {print}
-    ')
-
-    title=$(printf '%s\n' "$block" | awk '
-        /Assignment 2/ {
-            sub(/^[[:space:]]+/, "")
-            sub(/[[:space:]]+Week.*/, "")
-            sub(/[[:space:]]+$/, "")
-            print
-            exit
-        }
-    ')
-
-    topic=$(printf '%s\n' "$block" | awk '
-        /Programming task[[:space:]]*-/ {
-            sub(/^.*Programming task[[:space:]]*-[[:space:]]*/, "")
-            sub(/[[:space:]]+[0-9]+%.*/, "")
-            sub(/[[:space:]]+$/, "")
-            print
-            exit
-        }
-    ')
-
-    due=$(printf '%s\n' "$block" | awk '
-        /Due date:/ {
-            sub(/^.*Due date:[[:space:]]*/, "")
-            if ($4 == "at")
-                print $1 " " $2 " " $3 " " $5
-            exit
-        }
-    ')
-
-    points=$(printf '%s\n' "$block" | awk '
-        /Programming task/ && match($0, /[0-9]+%/) {
-            print substr($0, RSTART, RLENGTH - 1)
-            exit
-        }
-    ')
-
-    if [[ -z "$title" || -z "$topic" || -z "$due" ||
-          ! "$points" =~ ^[0-9]+$ ]]; then
-        echo "Error: assignment fields could not be extracted." >&2
-        printf '{"error":"Could not extract assignment fields"}\n'
-        return 1
-    fi
-
-    # Display the downloaded assignment information on the server.
     printf '%s\n' "$block" >&2
-
-    output_file="$response_dir/assignment.json"
-
-    if ! printf '{\n  "title": "%s",\n  "topic": "%s",\n  "due_date": "%s",\n  "points": %s\n}\n' \
-        "$(json_escape "$title")" \
-        "$(json_escape "$topic")" \
-        "$(json_escape "$due")" \
-        "$((10#$points))" > "$output_file"; then
-        echo "Error: could not write assignment.json." >&2
-        printf '{"error":"Could not create assignment.json"}\n'
-        return 1
-    fi
-
-    send_response_file "$output_file"
+    jq -n --arg title "$title" --arg topic "$topic" --arg due "$due" --arg points "$points" \
+        '{title:$title, topic:$topic, due_date:$due, points:($points|tonumber)}' \
+        > assignment.json || { error 'Could not create assignment.json'; return 1; }
+    cat assignment.json
 }
 
 population_response() {
-    local work_dir output_file header row year population
-    local latest_year=0 latest_population=""
-    local -a years fields
-
-    work_dir=$(mktemp -d) || {
-        echo "Error: could not create temporary directory." >&2
-        printf '{"error":"Could not prepare population data"}\n'
-        return 1
-    }
-
-    if ! curl -fLsS --max-time 30 \
-        'https://dbr.abs.gov.au/processedData/csv/STE_1.csv' \
-        -o "$work_dir/source.csv"; then
-        echo "Error: population download failed." >&2
-        rm -rf -- "$work_dir"
-        printf '{"error":"Population download failed"}\n'
-        return 1
-    fi
-
-    IFS= read -r header < "$work_dir/source.csv"
-    header=${header%$'\r'}
-    IFS=',' read -r -a years <<< "$header"
-
-    # Bash extracts the year/population pairs.
-    while IFS= read -r row || [[ -n "$row" ]]; do
-        row=${row%$'\r'}
-        IFS=',' read -r -a fields <<< "$row"
-
-        [[ "${fields[0]:-}" == "ERP_P_20" ]] || continue
-
-        for ((i = 3; i < ${#years[@]}; i++)); do
-            year=${years[i]}
-            population=${fields[i]:-}
-
-            if [[ "$year" =~ ^[0-9]{4}$ &&
-                  "$population" =~ ^[0-9]+$ ]]; then
-                printf '%s,%s\n' "$year" "$population"
-
-                if (( 10#$year > latest_year )); then
-                    latest_year=$((10#$year))
-                    latest_population=$population
-                fi
+    local header row year population latest_year=0 latest_population i
+    local -a years values
+    curl -fLsS --max-time 30 'https://dbr.abs.gov.au/processedData/csv/STE_1.csv' \
+        -o "$work/population.csv" || { error 'Population download failed'; return 1; }
+    IFS= read -r header < "$work/population.csv"
+    row=$(grep '^ERP_P_20,' "$work/population.csv")
+    IFS=',' read -r -a years <<< "${header%$'\r'}"
+    IFS=',' read -r -a values <<< "${row%$'\r'}"
+    # Bash extracts every available year/population pair from the CSV.
+    for ((i=3; i<${#years[@]}; i++)); do
+        year=${years[i]}
+        population=${values[i]:-}
+        if [[ "$year" =~ ^[0-9]{4}$ && "$population" =~ ^[0-9]+$ ]]; then
+            printf '%s,%s\n' "$year" "$population"
+            if (( 10#$year > latest_year )); then
+                latest_year=$((10#$year))
+                latest_population=$population
             fi
-        done
-
-        break
-    done < "$work_dir/source.csv" > "$work_dir/pairs.csv"
-
-    if [[ -z "$latest_population" ]]; then
-        echo "Error: no valid population data found." >&2
-        rm -rf -- "$work_dir"
-        printf '{"error":"No valid population data found"}\n'
-        return 1
-    fi
-
-    printf 'Latest NSW population (%s): %s\n' \
-        "$latest_year" "$latest_population" >&2
-
-    # AI acknowledgement: this Python plotting section was generated
-    # with assistance from OpenAI ChatGPT.
-    # It reads only the pairs already extracted by Bash.
-    if ! python3 - "$work_dir/pairs.csv" "$work_dir/population.png" <<'PY'
+        fi
+    done > "$work/pairs.csv"
+    (( latest_year > 0 )) || { error 'No population data found'; return 1; }
+    printf 'Latest NSW population (%s): %s\n' "$latest_year" "$latest_population" >&2
+    # AI-generated plotting code. Python only reads Bash-extracted pairs.
+    if ! python3 - "$work/pairs.csv" <<'PY'
 import sys
-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import StrMethodFormatter
 
-pairs = []
-with open(sys.argv[1], encoding="utf-8") as source:
-    for line in source:
-        year, population = line.strip().split(",")
-        pairs.append((int(year), int(population)))
-
-pairs.sort()
+with open(sys.argv[1]) as source:
+    pairs = sorted(tuple(map(int, line.strip().split(","))) for line in source)
 years, populations = zip(*pairs)
-
 fig, ax = plt.subplots(figsize=(9, 5))
 ax.plot(years, populations, marker="o")
-ax.set_title("NSW estimated resident population — 30 June")
-ax.set_xlabel("Year")
-ax.set_ylabel("Population (people)")
+ax.set(title="NSW estimated resident population - 30 June",
+       xlabel="Year", ylabel="Population (people)")
 ax.set_xticks(years)
 ax.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
 ax.grid(True, alpha=0.3)
 fig.tight_layout()
-fig.savefig(sys.argv[2], dpi=150)
+fig.savefig("population.png", dpi=150)
 plt.close(fig)
 PY
     then
-        echo "Error: population plotting failed." >&2
-        rm -rf -- "$work_dir"
-        printf '{"error":"Population plotting failed"}\n'
-        return 1
+        error 'Could not generate population plot'; return 1
     fi
-
-    output_file="$response_dir/population.png"
-
-    if ! mv -- "$work_dir/population.png" "$output_file"; then
-        echo "Error: could not save population.png." >&2
-        rm -rf -- "$work_dir"
-        printf '{"error":"Could not save population plot"}\n'
-        return 1
-    fi
-
-    rm -rf -- "$work_dir"
-
-    # Only the image bytes go to the client.
-    send_response_file "$output_file"
+    cat population.png
 }
 
-poi_response() (
-    # A subshell keeps this request's temporary files and traps isolated.
-    work_dir=""
-    trap '[[ -z "$work_dir" ]] || rm -rf -- "$work_dir"' EXIT
+api='https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_POI/MapServer/0/query'
+api_get() {
+    local destination="$1"
+    shift
+    curl -fSsG --connect-timeout 10 --max-time 60 "$api" \
+        --data-urlencode 'f=json' "$@" -o "$destination" || return 1
+    jq -e 'type == "object" and .error == null' "$destination" > /dev/null
+}
 
-    poi_fail() {
-        printf 'POI error: %s\n' "$1" >&2
-        jq -n --arg message "$1" '{error: $message}'
-        exit 1
-    }
+poi_batch() {
+    api_get "$work/batch.json" --data-urlencode "objectIds=$1" \
+        --data-urlencode 'outFields=objectid,poiname,poitype' \
+        --data-urlencode 'returnGeometry=true' --data-urlencode 'outSR=4326' || return 1
+    jq -e '(.features|type) == "array" and .exceededTransferLimit != true' \
+        "$work/batch.json" > /dev/null || return 1
+    jq -c '.features[]' "$work/batch.json" >> "$work/features.txt"
+}
 
-    api='https://maps.six.nsw.gov.au/arcgis/rest/services/public/NSW_POI/MapServer/0/query'
-    work_dir=$(mktemp -d) || poi_fail 'Could not create temporary directory'
-
-    poi_fetch() {
-        local destination="$1"
-        shift
-        curl -fSsG --connect-timeout 10 --max-time 60 "$api" \
-            --data-urlencode 'f=json' "$@" -o "$destination" ||
-            poi_fail 'NSW POI API request failed'
-        jq -e 'type == "object" and .error == null' "$destination" >/dev/null ||
-            poi_fail 'NSW POI API returned an error or invalid JSON'
-    }
-
-    input="$1"
-    separators="${input//[^|]/}"
-    IFS='|' read -r mode first second third <<< "$input"
-
+poi_response() {
+    local mode first second third separators radius latitude longitude name matches
+    local id batch="" number=0
+    separators=${1//[^|]/}
+    IFS='|' read -r mode first second third <<< "$1"
     case "$mode" in
         'poi name')
-            [[ ${#separators} -eq 2 && -n "$first" ]] ||
-                poi_fail 'Use poi name|PLACE NAME|RADIUS_METRES'
-            radius="$second"
-            ;;
+            [[ ${#separators} == 2 && -n "$first" ]] || {
+                error 'Use poi name|NAME|METRES'; return 1;
+            }
+            radius=$second ;;
         'poi coords')
-            [[ ${#separators} -eq 3 ]] ||
-                poi_fail 'Use poi coords|LATITUDE|LONGITUDE|RADIUS_METRES'
-            latitude="$first"
-            longitude="$second"
-            radius="$third"
-            ;;
-        *) poi_fail 'Unknown POI request format' ;;
+            [[ ${#separators} == 3 ]] || {
+                error 'Use poi coords|LATITUDE|LONGITUDE|METRES'; return 1;
+            }
+            latitude=$first; longitude=$second; radius=$third ;;
+        *) error 'Unknown POI format'; return 1 ;;
     esac
-
-    # Limit input size before arithmetic; radius must be a positive integer.
-    [[ "$radius" =~ ^[0-9]{1,6}$ ]] ||
-        poi_fail 'Radius must be an integer from 1 to 999999 metres'
+    [[ "$radius" =~ ^[0-9]{1,6}$ ]] || { error 'Invalid radius'; return 1; }
     radius=$((10#$radius))
-    (( radius > 0 )) || poi_fail 'Radius must be greater than zero'
-
+    (( radius > 0 )) || { error 'Radius must be greater than zero'; return 1; }
     if [[ "$mode" == 'poi name' ]]; then
-        name="${first^^}"
-        escaped_name=$(printf '%s' "$name" | sed "s/'/''/g")
-        poi_fetch "$work_dir/location.json" \
-            --data-urlencode "where=poiname='$escaped_name'" \
-            --data-urlencode 'outFields=objectid,poiname' \
-            --data-urlencode 'returnGeometry=true' \
-            --data-urlencode 'outSR=4326'
-
-        jq -e '.features | type == "array"' "$work_dir/location.json" >/dev/null ||
-            poi_fail 'Location lookup did not return a feature array'
-        matches=$(jq '.features | length' "$work_dir/location.json")
-        (( matches > 0 )) || poi_fail 'No POI matches that name; try its official name or coordinates'
-        [[ "$matches" == 1 ]] &&
-            jq -e '.exceededTransferLimit != true' "$work_dir/location.json" >/dev/null ||
-            poi_fail 'Multiple POIs match that name; use coordinates instead'
-        latitude=$(jq -r '.features[0].geometry.y' "$work_dir/location.json")
-        longitude=$(jq -r '.features[0].geometry.x' "$work_dir/location.json")
+        name=$(printf '%s' "$first" | tr '[:lower:]' '[:upper:]' | sed "s/'/''/g")
+        api_get "$work/location.json" --data-urlencode "where=poiname='$name'" \
+            --data-urlencode 'outFields=poiname' --data-urlencode 'returnGeometry=true' \
+            --data-urlencode 'outSR=4326' || { error 'POI name lookup failed'; return 1; }
+        matches=$(jq '.features | length' "$work/location.json")
+        [[ "$matches" != 0 ]] || { error 'POI name not found'; return 1; }
+        [[ "$matches" == 1 ]] || { error 'Ambiguous name: use coordinates'; return 1; }
+        latitude=$(jq -r '.features[0].geometry.y' "$work/location.json")
+        longitude=$(jq -r '.features[0].geometry.x' "$work/location.json")
     fi
-
-    [[ "$latitude" =~ ^-?[0-9]+(\.[0-9]+)?$ &&
-       "$longitude" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] ||
-        poi_fail 'Coordinates must be decimal numbers'
-    jq -en --arg lat "$latitude" --arg lon "$longitude" '
-        ($lat | tonumber) as $y | ($lon | tonumber) as $x |
-        $y >= -90 and $y <= 90 and $x >= -180 and $x <= 180
-    ' >/dev/null || poi_fail 'Latitude or longitude is out of range'
-
-    poi_fetch "$work_dir/ids.json" \
-        --data-urlencode 'where=1=1' \
-        --data-urlencode "geometry=$longitude,$latitude" \
-        --data-urlencode 'geometryType=esriGeometryPoint' \
-        --data-urlencode 'inSR=4326' \
-        --data-urlencode 'spatialRel=esriSpatialRelIntersects' \
-        --data-urlencode "distance=$radius" \
-        --data-urlencode 'units=esriSRUnit_Meter' \
-        --data-urlencode 'returnIdsOnly=true'
-
-    jq -e 'has("objectIds") and
-        (.objectIds == null or (.objectIds | type) == "array") and
-        (.exceededTransferLimit != true)' "$work_dir/ids.json" >/dev/null ||
-        poi_fail 'API returned an invalid or incomplete ID list'
-    jq '(.objectIds // []) | unique | sort' "$work_dir/ids.json" \
-        > "$work_dir/expected.json" || poi_fail 'Could not prepare POI IDs'
-    total=$(jq 'length' "$work_dir/expected.json")
-
-    for ((offset = 0; offset < total; offset += 500)); do
-        ids=$(jq -r --argjson start "$offset" '
-            .[$start:($start + 500)] | map(tostring) | join(",")
-        ' "$work_dir/expected.json") || poi_fail 'Could not prepare batch'
-        printf 'Fetching POIs %s-%s of %s\n' "$((offset + 1))" \
-            "$((offset + 500 < total ? offset + 500 : total))" "$total" >&2
-
-        poi_fetch "$work_dir/batch-$offset.json" \
-            --data-urlencode "objectIds=$ids" \
-            --data-urlencode 'outFields=objectid,poiname,poitype' \
-            --data-urlencode 'returnGeometry=true' \
-            --data-urlencode 'outSR=4326'
-        jq -e '(.features | type) == "array" and
-            (.exceededTransferLimit != true)' "$work_dir/batch-$offset.json" >/dev/null ||
-            poi_fail 'POI batch was invalid or incomplete'
-    done
-
-    if (( total == 0 )); then
-        printf '[]\n' > "$work_dir/features.json"
-    else
-        jq -s '[.[].features[]] | unique_by(.attributes.objectid)' \
-            "$work_dir"/batch-*.json > "$work_dir/features.json" ||
-            poi_fail 'Could not combine POI batches'
-    fi
-
-    jq -en --slurpfile expected "$work_dir/expected.json" \
-        --slurpfile features "$work_dir/features.json" '
-        $expected[0] == ($features[0] | map(.attributes.objectid) | unique | sort)
-    ' >/dev/null || poi_fail 'Returned POI IDs do not match requested IDs'
-
-    jq -n --arg lat "$latitude" --arg lon "$longitude" \
-        --argjson radius "$radius" --slurpfile features "$work_dir/features.json" '{
-        source: "NSW Points of Interest API",
-        center: {latitude: ($lat | tonumber), longitude: ($lon | tonumber)},
-        radius_metres: $radius,
-        count: ($features[0] | length),
-        pois: [$features[0][] | {
-            id: .attributes.objectid,
-            name: .attributes.poiname,
-            type: .attributes.poitype,
-            longitude: .geometry.x,
-            latitude: .geometry.y
-        }]
-    }' > "$work_dir/result.json" || poi_fail 'Could not create POI response'
-
-    output_file="$response_dir/nearby-pois.json"
-    mv -- "$work_dir/result.json" "$output_file" || poi_fail 'Could not save POI response'
-    printf 'Returning %s POIs within %s metres\n' "$total" "$radius" >&2
-    send_response_file "$output_file"
-)
-
-
-# Each connection runs in its own Bash worker. A directory created with
-# mkdir acts as an atomic lock for the client IP across all workers.
-serve_connection() (
-    local connection_dir="$1"
-    local listener_pid="" lock_dir="" owns_lock=0
-    local peer="" client_ip="" listening_port="" request=""
-    local announced=0 send_fd receive_fd listener_status
-    local response_dir=""
-
-    connection_cleanup() {
-        if [[ -n "$listener_pid" ]]; then
-            kill "$listener_pid" 2>/dev/null || true
-            wait "$listener_pid" 2>/dev/null || true
-        fi
-        if (( owns_lock )); then
-            rmdir -- "$lock_dir" 2>/dev/null || true
-        fi
-        if [[ -n "$response_dir" ]]; then
-            rm -rf -- "$response_dir"
-        fi
+    [[ "$latitude" =~ ^-?[0-9]+(\.[0-9]+)?$ && "$longitude" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || {
+        error 'Coordinates must be numbers'; return 1;
     }
-    trap connection_cleanup EXIT
+    awk -v y="$latitude" -v x="$longitude" 'BEGIN {exit !(y>=-90 && y<=90 && x>=-180 && x<=180)}' || {
+        error 'Latitude or longitude is out of range'; return 1;
+    }
+    api_get "$work/ids.json" --data-urlencode 'where=1=1' \
+        --data-urlencode "geometry=$longitude,$latitude" --data-urlencode 'geometryType=esriGeometryPoint' \
+        --data-urlencode 'inSR=4326' --data-urlencode 'spatialRel=esriSpatialRelIntersects' \
+        --data-urlencode "distance=$radius" --data-urlencode 'units=esriSRUnit_Meter' \
+        --data-urlencode 'returnIdsOnly=true' || { error 'POI radius lookup failed'; return 1; }
+    jq -e 'has("objectIds") and (.objectIds == null or (.objectIds|type) == "array")' \
+        "$work/ids.json" >/dev/null || { error 'Invalid POI ID list'; return 1; }
+    jq -r '.objectIds[]?' "$work/ids.json" | sort -n -u > "$work/expected.txt"
+    : > "$work/features.txt"
+    # Fetch at most 500 IDs per request to avoid the API result limit.
+    while IFS= read -r id; do
+        if [[ -n "$batch" ]]; then batch="$batch,$id"; else batch=$id; fi
+        number=$((number+1))
+        if (( number % 500 == 0 )); then
+            printf 'Fetching POI batch ending at %s\n' "$number" >&2
+            poi_batch "$batch" || { error 'POI batch failed'; return 1; }
+            batch=""
+        fi
+    done < "$work/expected.txt"
+    if [[ -n "$batch" ]]; then
+        poi_batch "$batch" || { error 'POI batch failed'; return 1; }
+    fi
+    jq -r '.attributes.objectid' "$work/features.txt" | sort -n -u > "$work/received.txt"
+    cmp -s "$work/expected.txt" "$work/received.txt" || { error 'Incomplete POI results'; return 1; }
+    jq -s --arg lat "$latitude" --arg lon "$longitude" --arg radius "$radius" '{
+        source:"NSW Points of Interest API",
+        center:{latitude:($lat|tonumber), longitude:($lon|tonumber)},
+        radius_metres:($radius|tonumber), count:length,
+        pois:map({id:.attributes.objectid, name:.attributes.poiname,
+                  type:.attributes.poitype, latitude:.geometry.y, longitude:.geometry.x})
+    }' "$work/features.txt" > nearby-pois.json || { error 'Could not create POI JSON'; return 1; }
+    printf 'Returning %s POIs\n' "$number" >&2
+    cat nearby-pois.json
+}
+
+handle_request() {
+    case "$1" in
+        assignment) assignment_response ;;
+        population) population_response ;;
+        poi\ *) poi_response "$1" ;;
+        *) error 'Unknown request' ;;
+    esac
+}
+
+# BusyBox netcat connects this handler's input/output to the client socket.
+if [[ "${INFO1112_CLIENT_MODE:-}" == 1 ]]; then
+    peer=$(ss -tnpH | awk -v pid="$$" '
+        index($0,"pid=" pid ",") {print $5; exit}')
+    client_ip=${peer%:*}
+    client_ip=${client_ip#\[}
+    client_ip=${client_ip%\]}
+    client_ip=${client_ip#::ffff:}
+    printf 'Client IP: %s\n' "$client_ip" >&2
+    # mkdir succeeds for only one handler, even if two connect together.
+    if ! mkdir "$work/busy" 2>/dev/null; then
+        printf 'Rejected busy client: %s\n' "$client_ip" >&2
+        error 'Server busy: another request is being processed'
+        exit 1
+    fi
+    trap 'rmdir "$work/busy" 2>/dev/null' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-
-    coproc CONNECTION { exec nc -4 -l -N "$SERVER_PORT"; }
-    listener_pid=$CONNECTION_PID
-    send_fd=${CONNECTION[1]}
-    receive_fd=${CONNECTION[0]}
-
-    # Inspect both listening and connected sockets. This also handles a
-    # client arriving before the first listening-socket inspection.
-    while [[ -z "$peer" ]]; do
-        listening_port=$(ss -ltnpH | awk -v pid="$listener_pid" '
-            index($0, "pid=" pid ",") {
-                address=$4; sub(/^.*:/, "", address); print address; exit
-            }
-        ')
-        if [[ -n "$listening_port" ]] && (( ! announced )); then
-            printf 'Server listening at %s, port=%s\n' "$server_ip" "$listening_port"
-            announced=1
-        fi
-
-        peer=$(ss -tnpH | awk -v pid="$listener_pid" '
-            index($0, "pid=" pid ",") &&
-            ($1 == "ESTAB" || $1 == "CLOSE-WAIT") {print $5; exit}
-        ')
-        [[ -n "$peer" ]] && break
-
-        if ! kill -0 "$listener_pid" 2>/dev/null; then
-            if wait "$listener_pid"; then
-                listener_status=0
-            else
-                listener_status=$?
-            fi
-            listener_pid=""
-            if (( listener_status == 0 )); then
-                echo 'Client disconnected before identification; listening again.' >&2
-                exit 75
-            fi
-            echo 'Error: netcat listener failed.' >&2
-            exit 1
-        fi
-        sleep 0.1
-    done
-
-    client_ip="${peer%:*}"
-    [[ "$client_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-        echo 'Error: could not identify an IPv4 client.' >&2
-        exit 1
-    }
-    lock_dir="$server_work_dir/busy-$client_ip"
-    if mkdir -- "$lock_dir" 2>/dev/null; then
-        owns_lock=1
-    elif [[ ! -d "$lock_dir" ]]; then
-        echo 'Error: could not create client lock.' >&2
+    if ! IFS= read -r -t 30 request; then
+        error 'No complete request received'
         exit 1
     fi
+    request=${request%$'\r'}
+    printf 'Received: %s\n' "$request" >&2
+    handle_request "$request"
+    exit $?
+fi
 
-    # The accepted connection no longer needs the listening socket.
-    # Notify the parent to start listening for the next connection.
-    touch "$connection_dir/accepted" || exit 1
-    printf 'Client IP: %s\n' "$client_ip"
-
-    if ! IFS= read -r -t 30 -u "$receive_fd" request; then
-        printf '{"error":"No complete request received within 30 seconds"}\n' >&"$send_fd"
-    elif (( ! owns_lock )); then
-        printf 'Rejected busy client: %s\n' "$client_ip"
-        printf '{"error":"A request from this client IP is already being processed"}\n' >&"$send_fd"
-    else
-        request=${request%$'\r'}
-        printf 'Received: %s\n' "$request"
-        response_dir=$(mktemp -d "$server_work_dir/response.XXXXXX") || {
-            printf '{"error":"Could not prepare response files"}\n' >&"$send_fd"
-            exit 1
-        }
-        case "$request" in
-            assignment)
-                if ! assignment_response >&"$send_fd"; then
-                    echo 'Assignment request failed.' >&2
-                fi
-                ;;
-            population)
-                if ! population_response >&"$send_fd"; then
-                    echo 'Population request failed.' >&2
-                fi
-                ;;
-            poi\ *)
-                if ! poi_response "$request" >&"$send_fd"; then
-                    echo 'POI request failed.' >&2
-                fi
-                ;;
-            *) printf '{"error":"Unknown request"}\n' >&"$send_fd" ;;
-        esac
-    fi
-
-    exec {send_fd}>&-
-    exec {receive_fd}<&-
-
-    # Bound the time spent waiting for a client to close after the reply.
-    for ((finish_attempt=0; finish_attempt<100; finish_attempt++)); do
-        kill -0 "$listener_pid" 2>/dev/null || break
-        sleep 0.1
+server_ip=$(ifconfig eth0 | awk '/inet / {print $2}')
+[[ -n "$server_ip" ]] || { echo 'Error: no server IP found.' >&2; exit 1; }
+work=$(mktemp -d) || exit 1
+cleanup() {
+    local child
+    # Stop any connected handlers, then the persistent listener.
+    for child in $(ps -o pid,ppid | awk -v parent="${listener:-0}" '$2==parent {print $1}'); do
+        kill "$child" 2>/dev/null || true
     done
-    kill "$listener_pid" 2>/dev/null || true
-    wait "$listener_pid" 2>/dev/null || true
-    listener_pid=""
-)
-
-server_work_dir=$(mktemp -d) || exit 1
-workers=()
-
-server_cleanup() {
-    local pid
-    for pid in "${workers[@]}"; do
-        kill "$pid" 2>/dev/null || true
-    done
-    for pid in "${workers[@]}"; do
-        wait "$pid" 2>/dev/null || true
-    done
-    rm -rf -- "$server_work_dir"
+    [[ -z "${listener:-}" ]] || kill "$listener" 2>/dev/null || true
+    wait 2>/dev/null || true
+    rm -rf -- "$work"
 }
-trap server_cleanup EXIT
+trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-while true; do
-    # Reap completed workers; their traps have already released their locks.
-    active_workers=()
-    for pid in "${workers[@]}"; do
-        if kill -0 "$pid" 2>/dev/null; then
-            active_workers+=("$pid")
-        else
-            wait "$pid" 2>/dev/null || true
-        fi
-    done
-    workers=("${active_workers[@]}")
+export INFO1112_WORK="$work"
+export INFO1112_SCRIPT="$PWD/$(basename -- "$0")"
+# -e takes an executable file; this small wrapper starts the Bash handler.
+printf '#!/bin/sh\nexec bash "$INFO1112_SCRIPT"\n' > "$work/handler"
+chmod +x "$work/handler"
 
-    connection_dir=$(mktemp -d "$server_work_dir/connection.XXXXXX") || exit 1
-    serve_connection "$connection_dir" &
-    worker_pid=$!
-    workers+=("$worker_pid")
-
-    while [[ ! -f "$connection_dir/accepted" ]]; do
-        if ! kill -0 "$worker_pid" 2>/dev/null; then
-            if wait "$worker_pid"; then
-                worker_status=0
-            else
-                worker_status=$?
-            fi
-            # Exclude the reaped worker from later cleanup/reaping.
-            unset 'workers[${#workers[@]}-1]'
-            if (( worker_status == 75 )); then
-                rmdir -- "$connection_dir" 2>/dev/null || true
-                continue 2
-            fi
-            echo 'Error: connection worker stopped before accepting a client.' >&2
-            exit 1
-        fi
-        sleep 0.1
-    done
-    rm -f -- "$connection_dir/accepted"
-    rmdir -- "$connection_dir"
+# BusyBox -lk keeps one listener open and starts a handler for each client.
+INFO1112_CLIENT_MODE=1 busybox nc -lk -p "$SERVER_PORT" -e "$work/handler" &
+listener=$!
+port=""
+for ((attempt=0; attempt<30; attempt++)); do
+    port=$(ss -ltnpH | awk -v pid="$listener" '
+        index($0,"pid=" pid ",") {p=$4; sub(/^.*:/,"",p); print p; exit}')
+    [[ -n "$port" ]] && break
+    kill -0 "$listener" 2>/dev/null || break
+    sleep 0.1
 done
+if [[ -z "$port" ]]; then
+    echo 'Error: could not detect listening port.' >&2
+    exit 1
+fi
+printf 'Server listening at %s, port=%s\n' "$server_ip" "$port"
+wait "$listener"
